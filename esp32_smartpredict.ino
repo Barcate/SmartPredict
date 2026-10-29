@@ -2,13 +2,36 @@
 #include <Wire.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
-#include <WebServer.h>
-#include <ESPmDNS.h>
 #include <PubSubClient.h>
 #include <Adafruit_MPU6050.h>
 #include <Adafruit_Sensor.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
+#include <esp_sleep.h>
+#include <esp_system.h>
+#include <time.h>
+#include <stdarg.h>
+#include <math.h>
+
+// =====================================================
+// COMO FUNCIONA (MODO ECONOMIA)
+// =====================================================
+// A ESP32 passa quase todo o tempo em DEEP SLEEP.
+//
+// A cada 5 s ela acorda, le os sensores SEM ligar o Wi-Fi
+// (~0,4 s acordada), guarda a leitura na memoria RTC (que
+// sobrevive ao sono) e volta a dormir.
+//
+// A cada 12 leituras (1 min) ela liga o Wi-Fi, envia todas as
+// leituras de uma vez pelo MQTT (HiveMQ), envia o console e
+// desliga o Wi-Fi de novo.
+//
+// Se o Wi-Fi falhar, as leituras ficam guardadas (ate 36) e
+// as tentativas ficam mais espacadas para nao gastar bateria.
+//
+// GRAVAR CODIGO NOVO: enquanto dorme, a ESP32 some da USB.
+// Segure o botao BOOT, aperte e solte RESET, solte BOOT e
+// clique em Carregar na Arduino IDE.
 
 // =====================================================
 // WIFI
@@ -31,13 +54,22 @@ const char* MQTT_SENHA = "Senha123";
 const char* MQTT_TOPICO =
   "senai/manutencao/maquina01/sensores";
 
-// =====================================================
-// PAINEL WEB DA ESP32
-// =====================================================
-// Acesse por http://<IP da ESP32> ou http://smartpredict-esp32.local
-// O IP tambem e enviado no MQTT para o Raspberry achar sozinho.
+// Mensagens do console (o mesmo texto do Monitor Serial)
+const char* MQTT_TOPICO_CONSOLE =
+  "senai/manutencao/maquina01/console";
 
-const char* NOME_MDNS = "smartpredict-esp32";
+// =====================================================
+// TEMPOS (ajuste aqui)
+// =====================================================
+
+const uint32_t INTERVALO_LEITURA_MS = 5000;  // uma leitura a cada 5 s
+const uint8_t AMOSTRAS_POR_ENVIO = 12;       // 12 x 5 s = envio a cada 1 min
+                                             // (24 = a cada 2 min: gasta ainda menos)
+const uint8_t MAX_AMOSTRAS = 36;             // fila maxima se o Wi-Fi cair
+const uint8_t MAX_MULTIPLICADOR_ESPERA = 10; // apos falhas: tenta no maximo a cada 10 min
+
+const uint32_t TIMEOUT_WIFI_RAPIDO_MS = 10000;  // conexao direta (canal/BSSID guardados)
+const uint32_t TIMEOUT_WIFI_SCAN_MS = 15000;    // conexao depois de escanear
 
 // =====================================================
 // PINOS
@@ -55,7 +87,126 @@ const char* NOME_MDNS = "smartpredict-esp32";
 #define MIC_PIN 4
 
 // =====================================================
-// OBJETOS E VARIAVEIS
+// SENSORES
+// =====================================================
+
+const uint32_t JANELA_MIC_MS = 50;     // janela de amostragem do som
+
+// Vibracao: 200 amostras a 1 kHz (0,2 s). Com isso da para
+// calcular o RMS (intensidade da vibracao) e o pico, que dizem
+// muito mais sobre a maquina do que uma leitura unica.
+const uint16_t AMOSTRAS_VIB = 200;
+const uint32_t PERIODO_VIB_US = 1000;
+
+// DS18B20 em 10 bits: precisao de 0,25 C e conversao de ~190 ms
+// (em 12 bits sao 750 ms com a CPU acordada).
+const uint8_t RESOLUCAO_DS18B20 = 10;
+
+// MPU6050 (acesso direto aos registradores para acordar e
+// dormir rapido, sem o reset de ~200 ms da biblioteca)
+const uint8_t MPU_ADDR = 0x68;
+const uint8_t MPU_SMPLRT_DIV = 0x19;
+const uint8_t MPU_CONFIG = 0x1A;
+const uint8_t MPU_ACCEL_CONFIG = 0x1C;
+const uint8_t MPU_ACCEL_XOUT_H = 0x3B;
+const uint8_t MPU_PWR_MGMT_1 = 0x6B;
+const uint8_t MPU_PWR_MGMT_2 = 0x6C;
+
+const uint8_t MPU_ACORDADO = 0x08;   // relogio interno, sensor de temperatura desligado
+const uint8_t MPU_DORMINDO = 0x48;   // idem + modo sleep (~5 uA)
+const float MPU_LSB_POR_G = 4096.0f; // faixa +-8 g
+const float GRAVIDADE = 9.80665f;
+
+// =====================================================
+// LEITURAS GUARDADAS (memoria RTC: sobrevive ao deep sleep)
+// =====================================================
+
+const int16_t SEM_TEMPERATURA = INT16_MIN;
+
+struct Amostra {
+  uint32_t ts;      // relogio interno da ESP32 (o Raspberry corrige para a hora real)
+  int16_t temp100;  // temperatura x 100 (SEM_TEMPERATURA = sem leitura)
+  int16_t mic;      // nivel pico a pico (-1 = sem leitura)
+  bool vibOK;
+  float vx, vy, vz; // media (posicao / gravidade), m/s2
+  float rx, ry, rz; // RMS da vibracao, m/s2
+  float pico;       // maior desvio em relacao a media, m/s2
+};
+
+RTC_DATA_ATTR Amostra amostras[MAX_AMOSTRAS];
+RTC_DATA_ATTR uint8_t nAmostras = 0;
+RTC_DATA_ATTR uint8_t amostrasDesdeTentativa = 0;
+RTC_DATA_ATTR uint8_t falhasSeguidas = 0;
+RTC_DATA_ATTR uint32_t perdidas = 0;   // leituras descartadas por fila cheia
+RTC_DATA_ATTR uint32_t ciclo = 0;
+
+// Wi-Fi: guarda canal e roteador para reconectar sem escanear
+RTC_DATA_ATTR bool wifiCacheOK = false;
+RTC_DATA_ATTR int32_t wifiCanal = 0;
+RTC_DATA_ATTR uint8_t wifiBSSID[6];
+RTC_DATA_ATTR bool txReduzida = false;
+
+// =====================================================
+// CONSOLE REMOTO
+// =====================================================
+// Funciona igual ao Serial (print, println, printf): escreve no
+// Monitor Serial normalmente e guarda uma copia na memoria RTC.
+// A copia e enviada pelo MQTT junto com o lote e depois limpa.
+// Se ficar cheio, descarta as mensagens mais antigas.
+
+const size_t CONSOLE_MAX = 2400;
+RTC_DATA_ATTR char consoleBuf[CONSOLE_MAX + 1];
+RTC_DATA_ATTR uint16_t consoleTam = 0;
+
+class ConsoleRemoto : public Print {
+ public:
+  size_t write(uint8_t c) override {
+    Serial.write(c);
+    guardar(c);
+    return 1;
+  }
+
+  size_t write(const uint8_t* dados, size_t tamanhoDados) override {
+    Serial.write(dados, tamanhoDados);
+    for (size_t i = 0; i < tamanhoDados; i++) {
+      guardar(dados[i]);
+    }
+    return tamanhoDados;
+  }
+
+  bool vazio() const { return consoleTam == 0; }
+
+  const char* texto() {
+    consoleBuf[consoleTam] = '\0';
+    return consoleBuf;
+  }
+
+  size_t tamanho() const { return consoleTam; }
+
+  void limpar() { consoleTam = 0; }
+
+ private:
+  void guardar(uint8_t c) {
+    if (c == '\r') return;
+
+    if (consoleTam >= CONSOLE_MAX) {
+      // Cheio: descarta a metade mais antiga, cortando numa quebra de linha.
+      size_t corte = CONSOLE_MAX / 2;
+      while (corte < consoleTam && consoleBuf[corte] != '\n') corte++;
+      if (corte < consoleTam) corte++;
+
+      memmove(consoleBuf, consoleBuf + corte, consoleTam - corte);
+      consoleTam -= corte;
+    }
+
+    consoleBuf[consoleTam++] = (char)c;
+  }
+};
+
+ConsoleRemoto Console;
+
+// =====================================================
+// OBJETOS
 // =====================================================
 
 Adafruit_MPU6050 mpu;
@@ -64,112 +215,11 @@ DallasTemperature tempSensor(&oneWire);
 
 WiFiClientSecure conexaoTLS;
 PubSubClient mqtt(conexaoTLS);
-WebServer servidor(80);
 
-bool mpuOK = false;
-bool tempOK = false;
-bool micOK = false;
-bool servidorIniciado = false;
-
-float vibX = 0;
-float vibY = 0;
-float vibZ = 0;
-float temperaturaMaquina = NAN;
-int micNivel = -1;  // -1 = sem leitura valida
-
-unsigned long ultimaTentativaMQTT = 0;
-unsigned long ultimaTentativaWiFi = 0;
-unsigned long ultimaPublicacao = 0;
-
-const unsigned long INTERVALO_MQTT = 5000;
-const unsigned long INTERVALO_RECONEXAO_WIFI = 30000;
-const unsigned long JANELA_MIC_MS = 50;  // janela de amostragem do som
-
-// =====================================================
-// PAGINA HTML DO PAINEL DA ESP32
-// =====================================================
-
-const char PAGINA_HTML[] PROGMEM = R"rawliteral(<!DOCTYPE html>
-<html lang="pt-BR"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>ESP32 - Maquina 01</title>
-<style>
-body{margin:0;background:#0f1420;color:#e6eaf2;font-family:system-ui,sans-serif;padding:12px}
-h1{font-size:16px;margin:0 0 10px}
-.g{display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:8px;margin-bottom:10px}
-.c{background:#171e2e;border:1px solid #263049;border-radius:8px;padding:8px 10px}
-.c small{display:block;color:#8892a6;font-size:11px}
-.c b{font-size:19px}
-canvas{width:100%;height:130px;display:block;background:#171e2e;border:1px solid #263049;border-radius:8px;margin-bottom:8px}
-.l{font-size:11px;color:#8892a6;margin:6px 0 2px}
-</style></head><body>
-<h1>ESP32-C3 &mdash; M&aacute;quina 01 <span id="st" style="font-size:12px;color:#8892a6"></span></h1>
-<div class="g" id="cards"></div>
-<div class="l">Temperatura da m&aacute;quina (&deg;C)</div><canvas id="c1"></canvas>
-<div class="l">Vibra&ccedil;&atilde;o X / Y / Z (m/s&sup2;) &mdash; vermelho X, amarelo Y, azul Z</div><canvas id="c2"></canvas>
-<div class="l">Microfone (n&iacute;vel)</div><canvas id="c3"></canvas>
-<script>
-const $=i=>document.getElementById(i);
-const H=[],MAX=90;
-$('cards').innerHTML=[['t','Temp. m\u00e1quina'],['x','Vibra\u00e7\u00e3o X'],['y','Vibra\u00e7\u00e3o Y'],['z','Vibra\u00e7\u00e3o Z'],['m','Microfone'],['r','Wi-Fi (dBm)'],['q','MQTT'],['u','Ligada h\u00e1'],['i','IP']]
- .map(([k,n])=>`<div class="c"><small>${n}</small><b id="v-${k}">\u2014</b></div>`).join('');
-const f=(v,d)=>typeof v==='number'?v.toFixed(d):'\u2014';
-function tempo(s){const h=Math.floor(s/3600),m=Math.floor(s%3600/60);return h?h+'h '+m+'min':m+'min '+(s%60)+'s';}
-function graf(cv,series){
-  const d=window.devicePixelRatio||1,w=cv.clientWidth,h=cv.clientHeight;
-  cv.width=w*d;cv.height=h*d;
-  const c=cv.getContext('2d');c.setTransform(d,0,0,d,0,0);c.font='10px sans-serif';
-  const vals=[];
-  series.forEach(s=>H.forEach(p=>{if(typeof p[s[0]]==='number')vals.push(p[s[0]]);}));
-  if(!vals.length){c.fillStyle='#8892a6';c.fillText('Aguardando dados...',8,h/2);return;}
-  let a=Math.min(...vals),b=Math.max(...vals);
-  if(a===b){a-=1;b+=1;}
-  const pd=(b-a)*.1;a-=pd;b+=pd;
-  const L=36,X=i=>L+(H.length<2?0:i*(w-L-6)/(H.length-1)),Y=v=>6+(b-v)*(h-12)/(b-a);
-  c.strokeStyle='#263049';c.fillStyle='#8892a6';c.lineWidth=1;
-  for(let k=0;k<=3;k++){
-    const y=6+k*(h-12)/3;
-    c.beginPath();c.moveTo(L,y);c.lineTo(w-6,y);c.stroke();
-    c.fillText((b-(b-a)*k/3).toFixed(1),2,y+3);
-  }
-  series.forEach(s=>{
-    c.strokeStyle=s[1];c.lineWidth=1.6;c.beginPath();
-    let on=false;
-    H.forEach((q,i)=>{
-      const v=q[s[0]];
-      if(typeof v!=='number'){on=false;return;}
-      if(!on){c.moveTo(X(i),Y(v));on=true;}else c.lineTo(X(i),Y(v));
-    });
-    c.stroke();
-  });
-}
-async function atualizar(){
-  try{
-    const r=await fetch('/api',{cache:'no-store'});
-    const d=await r.json();
-    const v=d.vibracao||{};
-    H.push({t:d.temperatura_analogica,x:v.x,y:v.y,z:v.z,m:d.mic_nivel});
-    if(H.length>MAX)H.shift();
-    $('v-t').textContent=f(d.temperatura_analogica,2);
-    $('v-x').textContent=f(v.x,2);
-    $('v-y').textContent=f(v.y,2);
-    $('v-z').textContent=f(v.z,2);
-    $('v-m').textContent=f(d.mic_nivel,0);
-    $('v-r').textContent=f(d.rssi,0);
-    $('v-q').textContent=d.mqtt?'conectado':'desconectado';
-    $('v-u').textContent=tempo(d.uptime_s||0);
-    $('v-i').textContent=d.ip||'\u2014';
-    $('st').textContent='\u25CF online';$('st').style.color='#43a047';
-    graf($('c1'),[['t','#4fc3f7']]);
-    graf($('c2'),[['x','#ef5350'],['y','#ffee58'],['z','#42a5f5']]);
-    graf($('c3'),[['m','#26c6da']]);
-  }catch(e){
-    $('st').textContent='\u25CF sem resposta';$('st').style.color='#e53935';
-  }
-}
-atualizar();
-setInterval(atualizar,1000);
-</script></body></html>)rawliteral";
+// Lote JSON (36 leituras cabem com folga)
+const size_t TAM_LOTE_JSON = 8192;
+const uint16_t TAM_BUFFER_MQTT = 8448;
+char loteJSON[TAM_LOTE_JSON];
 
 // =====================================================
 // WIFI
@@ -188,30 +238,30 @@ const char* textoStatusWiFi(wl_status_t status) {
   }
 }
 
-// Escaneia as redes, lista no Serial e procura a rede configurada.
+// Escaneia as redes, lista no console e procura a rede configurada.
 // Se achar, devolve o canal e o BSSID do ponto com sinal mais forte.
-bool escanearRedes(int32_t &canal, uint8_t bssid[6]) {
-  Serial.println("[WiFi] Escaneando redes...");
+bool escanearRedes(int32_t &canal, uint8_t bssid[6], int32_t &rssi) {
+  Console.println("[WiFi] Escaneando redes...");
 
   int total = WiFi.scanNetworks(false, true);
 
   if (total < 0) {
-    Serial.printf("[WiFi] Erro no scan (%d)\n", total);
+    Console.printf("[WiFi] Erro no scan (%d)\n", total);
     return false;
   }
 
   if (total == 0) {
-    Serial.println("[WiFi] Nenhuma rede encontrada.");
+    Console.println("[WiFi] Nenhuma rede encontrada.");
     return false;
   }
 
-  Serial.printf("[WiFi] %d redes encontradas:\n", total);
+  Console.printf("[WiFi] %d redes encontradas:\n", total);
 
   int melhor = -1;
   int32_t melhorRSSI = -1000;
 
   for (int i = 0; i < total; i++) {
-    Serial.printf(
+    Console.printf(
       "  %2d) %-32s | %4d dBm | canal %2d\n",
       i + 1,
       WiFi.SSID(i).c_str(),
@@ -230,14 +280,15 @@ bool escanearRedes(int32_t &canal, uint8_t bssid[6]) {
   if (melhor >= 0) {
     canal = WiFi.channel(melhor);
     memcpy(bssid, WiFi.BSSID(melhor), 6);
+    rssi = melhorRSSI;
     encontrou = true;
 
-    Serial.printf(
+    Console.printf(
       "[WiFi] Rede \"%s\" encontrada: %d dBm, canal %d\n",
       WIFI_SSID, melhorRSSI, canal
     );
   } else {
-    Serial.printf(
+    Console.printf(
       "[WiFi] Rede \"%s\" NAO apareceu no scan.\n",
       WIFI_SSID
     );
@@ -247,166 +298,296 @@ bool escanearRedes(int32_t &canal, uint8_t bssid[6]) {
   return encontrou;
 }
 
-bool conectarWiFi() {
-  ultimaTentativaWiFi = millis();
+// Espera conectar; se conseguir, guarda canal e BSSID para a proxima vez.
+bool esperarWiFi(uint32_t limiteMs) {
+  unsigned long inicio = millis();
 
-  Serial.println("\n[WiFi] Iniciando conexao...");
-
-  // Ordem importa: primeiro liga o modo estacao, depois desconecta
-  WiFi.persistent(false);
-  WiFi.mode(WIFI_STA);
-  WiFi.setSleep(false);
-  WiFi.disconnect();
-  delay(300);
-
-  const int MAX_TENTATIVAS = 3;
-
-  for (int tentativa = 1; tentativa <= MAX_TENTATIVAS; tentativa++) {
-    Serial.printf(
-      "\n[WiFi] Tentativa %d de %d\n",
-      tentativa, MAX_TENTATIVAS
-    );
-
-    // Na ultima tentativa, reduz a potencia de transmissao.
-    // Resolve problema comum em placas ESP32-C3/S3 mini.
-    if (tentativa == MAX_TENTATIVAS) {
-      Serial.println("[WiFi] Reduzindo potencia de transmissao...");
-      WiFi.setTxPower(WIFI_POWER_8_5dBm);
-    }
-
-    int32_t canal = 0;
-    uint8_t bssid[6];
-
-    if (escanearRedes(canal, bssid)) {
-      WiFi.begin(WIFI_SSID, WIFI_SENHA, canal, bssid);
-    } else {
-      WiFi.begin(WIFI_SSID, WIFI_SENHA);
-    }
-
-    unsigned long inicio = millis();
-
-    while (WiFi.status() != WL_CONNECTED &&
-           millis() - inicio < 15000) {
-      delay(500);
-      Serial.print(".");
-    }
-
-    if (WiFi.status() == WL_CONNECTED) {
-      Serial.println("\n[WiFi] Conectado!");
-      Serial.print("[WiFi] IP: ");
-      Serial.println(WiFi.localIP());
-      Serial.printf("[WiFi] Sinal: %d dBm\n", WiFi.RSSI());
-      return true;
-    }
-
-    wl_status_t status = WiFi.status();
-    Serial.printf(
-      "\n[WiFi] Falhou. Estado: %d (%s)\n",
-      status, textoStatusWiFi(status)
-    );
-
-    WiFi.disconnect();
-    delay(1000);
+  while (WiFi.status() != WL_CONNECTED &&
+         millis() - inicio < limiteMs) {
+    delay(100);
   }
 
-  Serial.println("[WiFi] Nao foi possivel conectar. Tentando de novo em 30 s.");
+  if (WiFi.status() == WL_CONNECTED) {
+    wifiCanal = WiFi.channel();
+    memcpy(wifiBSSID, WiFi.BSSID(), 6);
+    wifiCacheOK = true;
+
+    Console.printf(
+      "[WiFi] Conectado em %lu ms | IP %s | %d dBm\n",
+      millis() - inicio,
+      WiFi.localIP().toString().c_str(),
+      WiFi.RSSI()
+    );
+    return true;
+  }
+
+  wl_status_t status = WiFi.status();
+  Console.printf(
+    "[WiFi] Falhou. Estado: %d (%s)\n",
+    status, textoStatusWiFi(status)
+  );
   return false;
 }
 
-// =====================================================
-// MQTT
-// =====================================================
+// Desliga e religa o radio por completo. Sem isso, se a tentativa
+// anterior ainda estiver "conectando", a ESP32 recusa a nova
+// configuracao ("sta is connecting, cannot set config").
+void prepararRadio(bool potenciaReduzida) {
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+  delay(100);
 
-void conectarMQTT() {
-  if (WiFi.status() != WL_CONNECTED || mqtt.connected()) {
-    return;
+  WiFi.persistent(false);
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(true);  // modem sleep enquanto conectado
+
+  if (potenciaReduzida) {
+    // Resolve problema comum em placas ESP32-C3/S3 mini
+    // (antena ruim que nao conecta na potencia maxima).
+    WiFi.setTxPower(WIFI_POWER_8_5dBm);
   }
+}
 
-  if (millis() - ultimaTentativaMQTT < 5000) {
-    return;
-  }
+bool tentarConectar(bool potenciaReduzida, bool usarRoteador,
+                    int32_t canal, const uint8_t* bssid, uint32_t limiteMs) {
+  prepararRadio(potenciaReduzida);
 
-  ultimaTentativaMQTT = millis();
+  Console.printf("[WiFi] Tentando com potencia %s...\n",
+                 potenciaReduzida ? "reduzida" : "normal");
 
-  String idCliente = "SmartPredict-ESP32-" + WiFi.macAddress();
-
-  Serial.print("[MQTT] Conectando ao HiveMQ... ");
-
-  if (mqtt.connect(
-        idCliente.c_str(),
-        MQTT_USUARIO,
-        MQTT_SENHA)) {
-    Serial.println("conectado!");
-    Serial.print("[MQTT] Topico: ");
-    Serial.println(MQTT_TOPICO);
+  if (usarRoteador) {
+    WiFi.begin(WIFI_SSID, WIFI_SENHA, canal, bssid);
   } else {
-    Serial.print("falhou. Estado: ");
-    Serial.println(mqtt.state());
+    WiFi.begin(WIFI_SSID, WIFI_SENHA);
   }
+
+  if (esperarWiFi(limiteMs)) {
+    if (potenciaReduzida != txReduzida) {
+      txReduzida = potenciaReduzida;
+      Console.printf("[WiFi] Potencia %s funcionou; vou usar ela nas proximas vezes.\n",
+                     potenciaReduzida ? "reduzida" : "normal");
+    }
+    return true;
+  }
+
+  return false;
+}
+
+bool conectarWiFi() {
+  // 1) Caminho rapido: canal e roteador ja conhecidos (sem scan),
+  //    com a potencia que funcionou da ultima vez.
+  if (wifiCacheOK) {
+    Console.printf("[WiFi] Conectando direto (canal %ld)...\n", (long)wifiCanal);
+
+    if (tentarConectar(txReduzida, true, wifiCanal, wifiBSSID, TIMEOUT_WIFI_RAPIDO_MS)) {
+      return true;
+    }
+
+    Console.println("[WiFi] Conexao direta falhou; vou escanear.");
+    wifiCacheOK = false;
+  }
+
+  // 2) Escaneia para achar o ponto com melhor sinal
+  prepararRadio(txReduzida);
+
+  int32_t canal = 0;
+  uint8_t bssid[6];
+  int32_t rssi = -1000;
+  bool achou = escanearRedes(canal, bssid, rssi);
+
+  if (achou && rssi < -80) {
+    Console.printf("[WiFi] AVISO: sinal muito fraco (%ld dBm). "
+                   "Aproxime a ESP32 do roteador (ideal: acima de -75 dBm).\n",
+                   (long)rssi);
+  }
+
+  // 3) Primeiro com a potencia que funcionou da ultima vez,
+  //    depois com a outra.
+  if (tentarConectar(txReduzida, achou, canal, bssid, TIMEOUT_WIFI_SCAN_MS)) {
+    return true;
+  }
+
+  if (tentarConectar(!txReduzida, achou, canal, bssid, TIMEOUT_WIFI_SCAN_MS)) {
+    return true;
+  }
+
+  Console.println("[WiFi] Nao foi possivel conectar.");
+  return false;
+}
+
+void desligarWiFi() {
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
 }
 
 // =====================================================
-// LEITURA MPU6050
+// MPU6050 — VIBRACAO
 // =====================================================
 
-void lerMPU6050() {
-  if (!mpuOK) {
-    Serial.println("MPU6050: indisponivel");
-    return;
+bool mpuEscrever(uint8_t registrador, uint8_t valor) {
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(registrador);
+  Wire.write(valor);
+  return Wire.endTransmission() == 0;
+}
+
+bool mpuLerAceleracao(int16_t valores[3]) {
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(MPU_ACCEL_XOUT_H);
+
+  if (Wire.endTransmission(false) != 0) {
+    return false;
   }
 
-  sensors_event_t aceleracao, giro, temperaturaMPU;
-  mpu.getEvent(&aceleracao, &giro, &temperaturaMPU);
+  if (Wire.requestFrom((uint8_t)MPU_ADDR, (uint8_t)6) != 6) {
+    return false;
+  }
 
-  vibX = aceleracao.acceleration.x;
-  vibY = aceleracao.acceleration.y;
-  vibZ = aceleracao.acceleration.z;
+  for (int k = 0; k < 3; k++) {
+    uint8_t alto = Wire.read();
+    uint8_t baixo = Wire.read();
+    valores[k] = (int16_t)((alto << 8) | baixo);
+  }
 
-  Serial.printf(
-    "Vibracao X: %.3f | Y: %.3f | Z: %.3f m/s2\n",
-    vibX, vibY, vibZ
-  );
+  return true;
+}
+
+// Acorda o MPU, coleta 200 amostras a 1 kHz, calcula media,
+// RMS e pico e coloca o MPU para dormir de novo.
+bool lerVibracao(Amostra &a) {
+  if (!mpuEscrever(MPU_PWR_MGMT_1, MPU_ACORDADO)) {
+    Console.println("MPU6050: nao responde");
+    return false;
+  }
+
+  // Reaplica a configuracao a cada leitura: se o MPU perder
+  // energia por um instante, ele volta configurado certo.
+  mpuEscrever(MPU_PWR_MGMT_2, 0x07);    // giroscopio em standby (nao e usado)
+  mpuEscrever(MPU_SMPLRT_DIV, 0x00);    // 1 kHz
+  mpuEscrever(MPU_CONFIG, 0x01);        // filtro passa-baixa de 184 Hz
+  mpuEscrever(MPU_ACCEL_CONFIG, 0x10);  // faixa +-8 g
+
+  delay(30);  // acelerometro estabiliza depois de sair do sono
+
+  double soma[3] = {0, 0, 0};
+  double somaQuadrados[3] = {0, 0, 0};
+  float minimo[3] = {1e9f, 1e9f, 1e9f};
+  float maximo[3] = {-1e9f, -1e9f, -1e9f};
+  uint16_t validas = 0;
+
+  unsigned long proxima = micros();
+
+  for (uint16_t i = 0; i < AMOSTRAS_VIB; i++) {
+    while ((long)(micros() - proxima) < 0) {
+      // espera o proximo instante (1 ms)
+    }
+    proxima += PERIODO_VIB_US;
+
+    int16_t bruto[3];
+    if (!mpuLerAceleracao(bruto)) {
+      continue;
+    }
+
+    for (int k = 0; k < 3; k++) {
+      float v = bruto[k] / MPU_LSB_POR_G * GRAVIDADE;
+      soma[k] += v;
+      somaQuadrados[k] += (double)v * v;
+      if (v < minimo[k]) minimo[k] = v;
+      if (v > maximo[k]) maximo[k] = v;
+    }
+    validas++;
+  }
+
+  mpuEscrever(MPU_PWR_MGMT_1, MPU_DORMINDO);
+
+  if (validas < AMOSTRAS_VIB / 2) {
+    Console.printf("MPU6050: leitura falhou (%u de %u amostras)\n",
+                   validas, AMOSTRAS_VIB);
+    return false;
+  }
+
+  float media[3];
+  float rms[3];
+  float pico = 0;
+
+  for (int k = 0; k < 3; k++) {
+    media[k] = soma[k] / validas;
+    double variancia = somaQuadrados[k] / validas - (double)media[k] * media[k];
+    rms[k] = variancia > 0 ? sqrt(variancia) : 0;
+
+    float desvio = max(maximo[k] - media[k], media[k] - minimo[k]);
+    if (desvio > pico) pico = desvio;
+  }
+
+  a.vx = media[0];
+  a.vy = media[1];
+  a.vz = media[2];
+  a.rx = rms[0];
+  a.ry = rms[1];
+  a.rz = rms[2];
+  a.pico = pico;
+  return true;
 }
 
 // =====================================================
-// LEITURA DS18B20
+// DS18B20 — TEMPERATURA DA MAQUINA
 // =====================================================
+// A conversao (~190 ms) roda em paralelo com a leitura da
+// vibracao e do microfone, para a ESP32 dormir mais cedo.
 
-void lerTemperatura() {
-  if (!tempOK) {
-    Serial.println("DS18B20: indisponivel");
-    return;
+bool iniciarTemperatura() {
+  tempSensor.begin();
+
+  if (tempSensor.getDeviceCount() == 0) {
+    Console.println("DS18B20: indisponivel");
+    return false;
   }
 
+  if (tempSensor.getResolution() != RESOLUCAO_DS18B20) {
+    tempSensor.setResolution(RESOLUCAO_DS18B20);
+  }
+
+  tempSensor.setWaitForConversion(false);
   tempSensor.requestTemperatures();
+  return true;
+}
+
+void terminarTemperatura(Amostra &a, unsigned long inicio) {
+  unsigned long limite =
+    tempSensor.millisToWaitForConversion(RESOLUCAO_DS18B20) + 50;
+
+  while (!tempSensor.isConversionComplete() &&
+         millis() - inicio < limite) {
+    delay(5);
+  }
 
   float temperatura = tempSensor.getTempCByIndex(0);
 
   if (temperatura == DEVICE_DISCONNECTED_C ||
       temperatura < -55 || temperatura > 125) {
-    temperaturaMaquina = NAN;
-    Serial.println("DS18B20: falha na leitura");
+    a.temp100 = SEM_TEMPERATURA;
+    Console.println("DS18B20: falha na leitura");
   } else {
-    temperaturaMaquina = temperatura;
-    Serial.printf(
-      "Temperatura da maquina: %.2f C\n",
-      temperaturaMaquina
-    );
+    a.temp100 = (int16_t)lroundf(temperatura * 100.0f);
   }
 }
 
 // =====================================================
-// LEITURA MICROFONE
+// MICROFONE
 // =====================================================
 // O sinal do microfone oscila em volta de um valor medio.
 // Uma leitura unica nao diz nada; o que indica o volume
 // e a diferenca entre o pico maximo e minimo numa janela.
 
-void lerMicrofone() {
+bool lerMicrofone(Amostra &a, bool detalhar) {
+  pinMode(MIC_PIN, INPUT);
+  analogReadResolution(12);                    // 0 a 4095
+  analogSetPinAttenuation(MIC_PIN, ADC_11db);  // faixa ate ~3.3V
+
   int minimo = 4095;
   int maximo = 0;
   long soma = 0;
-  int amostras = 0;
+  int amostrasMic = 0;
 
   unsigned long inicio = millis();
 
@@ -415,272 +596,417 @@ void lerMicrofone() {
     if (leitura < minimo) minimo = leitura;
     if (leitura > maximo) maximo = leitura;
     soma += leitura;
-    amostras++;
+    amostrasMic++;
   }
 
-  int media = amostras > 0 ? soma / amostras : 0;
+  int media = amostrasMic > 0 ? soma / amostrasMic : 0;
 
   // Sinal grudado em 0 ou 4095 = fio solto, pino errado ou sem alimentacao
   if ((maximo == 0) || (minimo == 4095)) {
-    micOK = false;
-    micNivel = -1;
-    Serial.printf(
+    a.mic = -1;
+    Console.printf(
       "Microfone: sinal travado em %d (verifique ligacao/pino)\n",
       media
     );
-    return;
+    return false;
   }
 
-  micOK = true;
-  micNivel = maximo - minimo;  // pico a pico (0 a 4095)
+  a.mic = maximo - minimo;  // pico a pico (0 a 4095)
 
-  Serial.printf(
-    "Microfone: nivel %d (min %d | max %d | media %d | %d amostras)\n",
-    micNivel, minimo, maximo, media, amostras
-  );
-}
-
-// =====================================================
-// MONTAR JSON (usado no MQTT e no painel web)
-// =====================================================
-// extras = false: mensagem do MQTT (inclui o IP para o Raspberry)
-// extras = true : resposta do painel web (inclui rssi, mqtt e uptime)
-
-void montarJSON(char* destino, size_t tamanho, bool extras) {
-  char tempJSON[24];
-
-  if (isnan(temperaturaMaquina)) {
-    snprintf(tempJSON, sizeof(tempJSON), "null");
-  } else {
-    snprintf(
-      tempJSON, sizeof(tempJSON), "%.2f",
-      temperaturaMaquina
+  if (detalhar) {
+    Console.printf(
+      "Microfone: nivel %d (min %d | max %d | media %d | %d amostras)\n",
+      a.mic, minimo, maximo, media, amostrasMic
     );
   }
 
-  char micJSON[16];
+  return true;
+}
 
-  if (!micOK || micNivel < 0) {
-    snprintf(micJSON, sizeof(micJSON), "null");
-  } else {
-    snprintf(micJSON, sizeof(micJSON), "%d", micNivel);
+// =====================================================
+// COLETA DE UMA LEITURA
+// =====================================================
+
+void guardarAmostra(const Amostra &a) {
+  if (nAmostras >= MAX_AMOSTRAS) {
+    // Fila cheia (sem Wi-Fi ha muito tempo): descarta a mais antiga
+    memmove(&amostras[0], &amostras[1], sizeof(Amostra) * (MAX_AMOSTRAS - 1));
+    nAmostras = MAX_AMOSTRAS - 1;
+    perdidas++;
   }
 
-  String ip = WiFi.localIP().toString();
+  amostras[nAmostras++] = a;
 
-  int n = snprintf(
-    destino,
-    tamanho,
-    "{\"mic_nivel\":%s,"
-    "\"temperatura_analogica\":%s,"
-    "\"vibracao\":{\"x\":%.3f,\"y\":%.3f,\"z\":%.3f},"
-    "\"ip\":\"%s\"",
-    micJSON,
-    tempJSON,
-    vibX,
-    vibY,
-    vibZ,
-    ip.c_str()
-  );
+  if (amostrasDesdeTentativa < 250) {
+    amostrasDesdeTentativa++;
+  }
+}
 
-  if (extras && n > 0 && (size_t)n < tamanho) {
-    n += snprintf(
-      destino + n,
-      tamanho - n,
-      ",\"rssi\":%d,\"mqtt\":%s,\"uptime_s\":%lu",
-      WiFi.RSSI(),
-      mqtt.connected() ? "true" : "false",
-      millis() / 1000UL
+void imprimirResumo(const Amostra &a) {
+  char temp[16];
+  char mic[8];
+
+  if (a.temp100 == SEM_TEMPERATURA) {
+    snprintf(temp, sizeof(temp), "temp --");
+  } else {
+    snprintf(temp, sizeof(temp), "%.2f C", a.temp100 / 100.0f);
+  }
+
+  if (a.mic < 0) {
+    snprintf(mic, sizeof(mic), "--");
+  } else {
+    snprintf(mic, sizeof(mic), "%d", a.mic);
+  }
+
+  if (a.vibOK) {
+    Console.printf(
+      "[#%lu] RMS %.3f/%.3f/%.3f pico %.3f | %s | mic %s | fila %u\n",
+      (unsigned long)ciclo, a.rx, a.ry, a.rz, a.pico,
+      temp, mic, nAmostras
+    );
+  } else {
+    Console.printf(
+      "[#%lu] vibracao -- | %s | mic %s | fila %u\n",
+      (unsigned long)ciclo, temp, mic, nAmostras
     );
   }
+}
 
-  if (n > 0 && (size_t)n < tamanho - 1) {
-    destino[n] = '}';
-    destino[n + 1] = '\0';
+void coletarAmostra(bool detalhar) {
+  Amostra a;
+  memset(&a, 0, sizeof(a));
+  a.ts = (uint32_t)time(nullptr);
+  a.temp100 = SEM_TEMPERATURA;
+  a.mic = -1;
+
+  unsigned long inicioTemp = millis();
+  bool temTemperatura = iniciarTemperatura();  // conversao comeca agora
+
+  a.vibOK = lerVibracao(a);                    // ~0,23 s
+  lerMicrofone(a, detalhar);                   // 0,05 s
+
+  if (temTemperatura) {
+    terminarTemperatura(a, inicioTemp);        // ja quase pronta
   }
+
+  guardarAmostra(a);
+  imprimirResumo(a);
 }
 
 // =====================================================
-// PUBLICAR DADOS MQTT
+// MONTAR LOTE JSON
 // =====================================================
+// Formato:
+// {"ip":"...","agora":<relogio ESP>,"perdidas":N,"lote":[
+//   {"ts":..,"mic_nivel":..,"temperatura_analogica":..,
+//    "vibracao":{"x":..,"y":..,"z":..},
+//    "vibracao_rms":{"x":..,"y":..,"z":..},
+//    "vibracao_pico":..}, ...]}
+// "agora" permite ao Raspberry converter cada "ts" para a hora real.
 
-void publicarDados() {
-  if (!mqtt.connected()) {
-    return;
+bool anexar(char* destino, size_t tamanho, size_t &pos, const char* formato, ...) {
+  if (pos >= tamanho) return false;
+
+  va_list args;
+  va_start(args, formato);
+  int n = vsnprintf(destino + pos, tamanho - pos, formato, args);
+  va_end(args);
+
+  if (n < 0 || (size_t)n >= tamanho - pos) {
+    pos = tamanho;
+    return false;
   }
 
-  char mensagem[320];
-  montarJSON(mensagem, sizeof(mensagem), false);
-
-  Serial.print("[MQTT] Publicando: ");
-  Serial.println(mensagem);
-
-  if (mqtt.publish(MQTT_TOPICO, mensagem)) {
-    Serial.println("[MQTT] Publicacao enviada!");
-  } else {
-    Serial.println("[MQTT] Falha ao publicar.");
-  }
+  pos += n;
+  return true;
 }
 
-// =====================================================
-// SERVIDOR WEB DA ESP32
-// =====================================================
+size_t montarLote(char* destino, size_t tamanho, const char* ip, uint32_t agora) {
+  size_t pos = 0;
 
-void rotaPagina() {
-  servidor.send_P(200, "text/html; charset=utf-8", PAGINA_HTML);
-}
-
-void rotaApi() {
-  char json[384];
-  montarJSON(json, sizeof(json), true);
-
-  servidor.sendHeader("Access-Control-Allow-Origin", "*");
-  servidor.sendHeader("Cache-Control", "no-store");
-  servidor.send(200, "application/json", json);
-}
-
-void iniciarServidor() {
-  if (servidorIniciado || WiFi.status() != WL_CONNECTED) {
-    return;
-  }
-
-  if (MDNS.begin(NOME_MDNS)) {
-    MDNS.addService("http", "tcp", 80);
-    Serial.printf("[WEB] Nome na rede: http://%s.local\n", NOME_MDNS);
-  } else {
-    Serial.println("[WEB] mDNS nao iniciou (use o IP).");
-  }
-
-  servidor.on("/", rotaPagina);
-  servidor.on("/api", rotaApi);
-  servidor.onNotFound([]() {
-    servidor.send(404, "text/plain", "Nao encontrado");
-  });
-
-  servidor.begin();
-  servidorIniciado = true;
-
-  Serial.printf(
-    "[WEB] Painel da ESP32: http://%s\n",
-    WiFi.localIP().toString().c_str()
+  bool ok = anexar(
+    destino, tamanho, pos,
+    "{\"ip\":\"%s\",\"agora\":%lu,\"perdidas\":%lu,\"lote\":[",
+    ip, (unsigned long)agora, (unsigned long)perdidas
   );
+
+  for (uint8_t i = 0; ok && i < nAmostras; i++) {
+    const Amostra &a = amostras[i];
+
+    char temp[16];
+    char mic[8];
+
+    if (a.temp100 == SEM_TEMPERATURA) {
+      snprintf(temp, sizeof(temp), "null");
+    } else {
+      snprintf(temp, sizeof(temp), "%.2f", a.temp100 / 100.0f);
+    }
+
+    if (a.mic < 0) {
+      snprintf(mic, sizeof(mic), "null");
+    } else {
+      snprintf(mic, sizeof(mic), "%d", a.mic);
+    }
+
+    ok = anexar(
+      destino, tamanho, pos,
+      "%s{\"ts\":%lu,\"mic_nivel\":%s,\"temperatura_analogica\":%s,",
+      i ? "," : "", (unsigned long)a.ts, mic, temp
+    );
+
+    if (!ok) break;
+
+    if (a.vibOK) {
+      ok = anexar(
+        destino, tamanho, pos,
+        "\"vibracao\":{\"x\":%.3f,\"y\":%.3f,\"z\":%.3f},"
+        "\"vibracao_rms\":{\"x\":%.4f,\"y\":%.4f,\"z\":%.4f},"
+        "\"vibracao_pico\":%.4f}",
+        a.vx, a.vy, a.vz, a.rx, a.ry, a.rz, a.pico
+      );
+    } else {
+      ok = anexar(
+        destino, tamanho, pos,
+        "\"vibracao\":null,\"vibracao_rms\":null,\"vibracao_pico\":null}"
+      );
+    }
+  }
+
+  if (ok) {
+    ok = anexar(destino, tamanho, pos, "]}");
+  }
+
+  return ok ? pos : 0;
 }
 
 // =====================================================
-// SETUP
+// ENVIO PELO MQTT
 // =====================================================
 
-void setup() {
-  Serial.begin(115200);
-  delay(2000);
-
-  Serial.println("\n=== SMARTPREDICT: MPU6050 + DS18B20 + MIC + MQTT + PAINEL ===");
-
-  // Wi-Fi primeiro (antes dos sensores), igual ao codigo de scan
-  conectarWiFi();
-
-  // MPU6050
-  Serial.println("\n[Testando MPU6050...]");
-
-  Wire.begin(SDA_PIN, SCL_PIN);
-  Wire.setClock(100000);
-
-  if (mpu.begin()) {
-    mpuOK = true;
-    mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
-    mpu.setGyroRange(MPU6050_RANGE_500_DEG);
-    mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
-    Serial.println("[OK] MPU6050 encontrado!");
-  } else {
-    Serial.println("[ERRO] MPU6050 nao encontrado.");
+// Envia tudo o que foi impresso desde o ultimo envio.
+// Nao imprime nada aqui dentro (senao a mensagem iria para o
+// proprio buffer que esta sendo enviado).
+void publicarConsole() {
+  if (Console.vazio() || !mqtt.connected()) {
+    return;
   }
 
-  // DS18B20
-  Serial.println("\n[Testando DS18B20...]");
-
-  tempSensor.begin();
-  tempSensor.setWaitForConversion(false);
-
-  if (tempSensor.getDeviceCount() > 0) {
-    tempOK = true;
-    Serial.println("[OK] DS18B20 encontrado!");
-  } else {
-    Serial.println("[ERRO] DS18B20 nao encontrado.");
+  if (mqtt.publish(MQTT_TOPICO_CONSOLE,
+                   (const uint8_t*)Console.texto(),
+                   Console.tamanho(), false)) {
+    Console.limpar();
   }
+}
 
-  // Microfone
-  Serial.println("\n[Configurando microfone...]");
-
-  pinMode(MIC_PIN, INPUT);
-  analogReadResolution(12);                      // 0 a 4095
-  analogSetPinAttenuation(MIC_PIN, ADC_11db);    // faixa ate ~3.3V
-
-  lerMicrofone();
-  if (micOK) {
-    Serial.println("[OK] Microfone respondendo!");
-  } else {
-    Serial.println("[ERRO] Microfone sem sinal valido.");
-  }
-
-  // SOMENTE PARA TESTE INICIAL.
-  // Antes de usar definitivamente, configure a CA raiz do HiveMQ.
+bool publicarTudo() {
+  // Mantido como no codigo original.
+  // setInsecure() nao valida o certificado do broker; para producao,
+  // configure a CA raiz do HiveMQ antes de expor o dispositivo.
   conexaoTLS.setInsecure();
 
   mqtt.setServer(MQTT_BROKER, MQTT_PORT);
-  mqtt.setSocketTimeout(15);
-  mqtt.setKeepAlive(60);
-  mqtt.setBufferSize(512);
+  mqtt.setSocketTimeout(10);
+  mqtt.setKeepAlive(30);
+  mqtt.setBufferSize(TAM_BUFFER_MQTT);
 
-  iniciarServidor();
-  conectarMQTT();
+  String idCliente = "SmartPredict-ESP32-" + WiFi.macAddress();
 
-  Serial.println("\nIniciando leituras...");
+  Console.print("[MQTT] Conectando ao HiveMQ... ");
+  unsigned long inicio = millis();
+
+  if (!mqtt.connect(idCliente.c_str(), MQTT_USUARIO, MQTT_SENHA)) {
+    Console.printf("falhou. Estado: %d\n", mqtt.state());
+    return false;
+  }
+
+  Console.printf("conectado (%lu ms).\n", millis() - inicio);
+
+  bool ok = false;
+  size_t tamanho = montarLote(
+    loteJSON, sizeof(loteJSON),
+    WiFi.localIP().toString().c_str(),
+    (uint32_t)time(nullptr)
+  );
+
+  if (tamanho == 0) {
+    Console.println("[MQTT] Lote nao coube no buffer; envio cancelado.");
+  } else if (mqtt.publish(MQTT_TOPICO, (const uint8_t*)loteJSON, tamanho, false)) {
+    Console.printf("[MQTT] Lote enviado: %u leituras (%u bytes).\n",
+                   nAmostras, (unsigned)tamanho);
+    nAmostras = 0;
+    perdidas = 0;
+    ok = true;
+  } else {
+    Console.println("[MQTT] Falha ao publicar o lote.");
+  }
+
+  publicarConsole();
+
+  // Da tempo dos pacotes sairem antes de fechar a conexao.
+  mqtt.loop();
+  delay(50);
+  mqtt.disconnect();
+  conexaoTLS.stop();
+
+  return ok;
+}
+
+// Decide se ja e hora de tentar enviar.
+// Depois de falhas, espera 2x, 4x, 8x... (no maximo 10x) mais.
+bool horaDeEnviar() {
+  uint8_t multiplicador = 1;
+
+  for (uint8_t i = 0; i < falhasSeguidas && multiplicador < MAX_MULTIPLICADOR_ESPERA; i++) {
+    multiplicador *= 2;
+  }
+
+  if (multiplicador > MAX_MULTIPLICADOR_ESPERA) {
+    multiplicador = MAX_MULTIPLICADOR_ESPERA;
+  }
+
+  return amostrasDesdeTentativa >= AMOSTRAS_POR_ENVIO * multiplicador;
+}
+
+void enviarLote() {
+  amostrasDesdeTentativa = 0;
+
+  // CPU mais rapida so durante o envio: o TLS termina antes e o
+  // radio (a parte que mais gasta) fica ligado por menos tempo.
+  setCpuFrequencyMhz(160);
+
+  bool ok = false;
+
+  if (conectarWiFi()) {
+    ok = publicarTudo();
+  }
+
+  desligarWiFi();
+  setCpuFrequencyMhz(80);
+
+  if (ok) {
+    falhasSeguidas = 0;
+  } else {
+    if (falhasSeguidas < 10) falhasSeguidas++;
+    Console.printf("[ENVIO] Falhou (%u seguidas). %u leituras guardadas.\n",
+                   falhasSeguidas, nAmostras);
+  }
+}
+
+// =====================================================
+// PRIMEIRA INICIALIZACAO (ligou na tomada / RESET)
+// =====================================================
+
+void primeiraInicializacao() {
+  delay(2000);  // tempo para abrir o Monitor Serial
+
+  nAmostras = 0;
+  amostrasDesdeTentativa = 0;
+  falhasSeguidas = 0;
+  perdidas = 0;
+  ciclo = 0;
+  wifiCacheOK = false;
+  txReduzida = false;
+  Console.limpar();
+
+  Console.println("\n=== SMARTPREDICT: MPU6050 + DS18B20 + MIC + MQTT ===");
+  Console.println("Modo economia: deep sleep entre leituras.");
+  Console.printf("Leitura a cada %lu s, envio a cada %u leituras.\n",
+                 (unsigned long)(INTERVALO_LEITURA_MS / 1000), AMOSTRAS_POR_ENVIO);
+  Console.println("Para gravar codigo novo: segure BOOT, aperte RESET, solte BOOT.");
+
+  // MPU6050
+  Console.println("\n[Testando MPU6050...]");
+
+  if (mpu.begin()) {
+    mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+    mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+    mpu.setFilterBandwidth(MPU6050_BAND_184_HZ);
+    Wire.setClock(400000);
+    mpuEscrever(MPU_PWR_MGMT_2, 0x07);
+    mpuEscrever(MPU_PWR_MGMT_1, MPU_DORMINDO);
+    Console.println("[OK] MPU6050 encontrado!");
+  } else {
+    Wire.setClock(400000);
+    Console.println("[ERRO] MPU6050 nao encontrado.");
+  }
+
+  // DS18B20
+  Console.println("\n[Testando DS18B20...]");
+
+  tempSensor.begin();
+
+  if (tempSensor.getDeviceCount() > 0) {
+    tempSensor.setResolution(RESOLUCAO_DS18B20);
+    Console.printf("[OK] DS18B20 encontrado! (%u bits)\n", RESOLUCAO_DS18B20);
+  } else {
+    Console.println("[ERRO] DS18B20 nao encontrado.");
+  }
+
+  // Microfone
+  Console.println("\n[Configurando microfone...]");
+
+  Amostra teste;
+  memset(&teste, 0, sizeof(teste));
+
+  if (lerMicrofone(teste, true)) {
+    Console.println("[OK] Microfone respondendo!");
+  } else {
+    Console.println("[ERRO] Microfone sem sinal valido.");
+  }
+
+  Console.println("\nIniciando leituras...");
+}
+
+// =====================================================
+// DORMIR ATE A PROXIMA LEITURA
+// =====================================================
+
+void dormir() {
+  uint32_t acordado = millis();
+  uint32_t espera = 100;
+
+  if (acordado + 100 < INTERVALO_LEITURA_MS) {
+    espera = INTERVALO_LEITURA_MS - acordado;
+  }
+
+  esp_sleep_enable_timer_wakeup((uint64_t)espera * 1000ULL);
+  esp_deep_sleep_start();
+}
+
+// =====================================================
+// SETUP (roda a cada vez que a ESP32 acorda)
+// =====================================================
+
+void setup() {
+  setCpuFrequencyMhz(80);  // suficiente para ler os sensores (economiza bateria)
+
+  Serial.begin(115200);
+
+  Wire.begin(SDA_PIN, SCL_PIN);
+  Wire.setClock(400000);   // I2C rapido: menos tempo acordada
+
+  bool acordouDoSono = (esp_reset_reason() == ESP_RST_DEEPSLEEP);
+
+  if (!acordouDoSono) {
+    primeiraInicializacao();
+  }
+
+  ciclo++;
+  coletarAmostra(!acordouDoSono);
+
+  // Na primeira vez envia logo, para conferir que tudo funciona.
+  if (!acordouDoSono || horaDeEnviar()) {
+    enviarLote();
+  }
+
+  dormir();
 }
 
 // =====================================================
 // LOOP
 // =====================================================
+// Nunca e executado: a ESP32 dorme no fim do setup() e,
+// ao acordar, comeca de novo pelo setup().
 
 void loop() {
-  if (WiFi.status() != WL_CONNECTED &&
-      millis() - ultimaTentativaWiFi >= INTERVALO_RECONEXAO_WIFI) {
-    conectarWiFi();
-  }
-
-  // Inicia o painel assim que houver Wi-Fi (inclusive apos reconexao)
-  iniciarServidor();
-
-  conectarMQTT();
-
-  if (mqtt.connected()) {
-    mqtt.loop();
-  }
-
-  Serial.println("\n========== LEITURAS ==========");
-
-  lerMPU6050();
-  lerTemperatura();
-  lerMicrofone();
-
-  Serial.println("==============================");
-
-  if (millis() - ultimaPublicacao >= INTERVALO_MQTT) {
-    ultimaPublicacao = millis();
-    publicarDados();
-  }
-
-  // Espera 500 ms, mas continua atendendo o painel web e o MQTT
-  unsigned long espera = millis();
-
-  while (millis() - espera < 500) {
-    if (servidorIniciado) {
-      servidor.handleClient();
-    }
-
-    if (mqtt.connected()) {
-      mqtt.loop();
-    }
-
-    delay(5);
-  }
 }
